@@ -1,4 +1,9 @@
-import os, re, time, json, hashlib, requests
+import os
+import re
+import time
+import json
+import hashlib
+import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -10,11 +15,46 @@ def clean_phone_number(n):
         n = '0' + n[2:]
     return n
 
-# ---------- AMBIL CSRF & SESSION ----------
+# ---------- AMBIL SESSION & CSRF (DENGAN DEBUG) ----------
 def get_session_and_csrf():
     s = requests.Session()
-    s.get('https://orderkuota.com/', headers={'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) Chrome/121'})
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+    }
+    resp = s.get('https://orderkuota.com/', headers=headers, timeout=30)
+    
+    # Debug
+    print(f"[DEBUG] Status: {resp.status_code}")
+    print(f"[DEBUG] Set-Cookie: {resp.headers.get('Set-Cookie', 'Tidak ada')}")
+    print(f"[DEBUG] Response length: {len(resp.text)}")
+
+    # Coba ambil dari cookie
     csrf = s.cookies.get('csrf_cookie', '')
+    if not csrf:
+        # Coba ambil dari HTML
+        match = re.search(r'name="csrf_token"\s+value="([^"]+)"', resp.text)
+        if match:
+            csrf = match.group(1)
+            print(f"[DEBUG] CSRF from HTML: {csrf}")
+        else:
+            # Coba cari pola lain
+            match2 = re.search(r'csrf_token\s*[:=]\s*["\']?([^"\'\s]+)["\']?', resp.text, re.I)
+            if match2:
+                csrf = match2.group(1)
+                print(f"[DEBUG] CSRF from text: {csrf}")
+    else:
+        print(f"[DEBUG] CSRF from cookies: {csrf}")
+    
     return s, csrf
 
 # ---------- PARSING PAKET (LENGKAP) ----------
@@ -41,7 +81,8 @@ def parse_packages(html):
         if not pkg or re.search(r'Sisa Pulsa', pkg, re.I):
             continue
         h = hashlib.md5(pkg.encode()).hexdigest()
-        if h in seen: continue
+        if h in seen:
+            continue
         seen.add(h)
         
         # --- Telkomsel ---
@@ -56,7 +97,8 @@ def parse_packages(html):
                 items = re.split(r'#\d+\s*-?\s*', paket_section[1])
                 for item in items:
                     item = item.strip(' -.#')
-                    if not item: continue
+                    if not item:
+                        continue
                     exp_match = re.search(r'aktif hingga\s*([^#\.]+)', item, re.I)
                     exp = exp_match.group(1).strip() if exp_match else '-'
                     if exp_match:
@@ -81,7 +123,8 @@ def parse_packages(html):
             benefits = []
             for b in right.split(','):
                 b = b.strip()
-                if not b: continue
+                if not b:
+                    continue
                 m = re.match(r'^(.*?)\s*-\s*(.*?)\s*-\s*(?:Exp|Expired)\s*:(.*)$', b, re.I)
                 if m:
                     benefits.append({'name': m.group(2).strip(), 'remaining': m.group(1).strip(), 'expiry': m.group(3).strip()})
@@ -104,7 +147,8 @@ def parse_packages(html):
         benefits = []
         for b in re.split(r'(?=DATA\s)|,', benefit_str):
             b = b.strip(' -,')
-            if not b: continue
+            if not b:
+                continue
             m = re.match(r'^(?:DATA\s+)?(.*?)\s+([\d\.]+\s*(?:GB|MB|KB|TB))$', b, re.I)
             if m:
                 bname = m.group(1).strip() or 'Kuota Internet'
@@ -151,12 +195,13 @@ def cek_kuota():
         if not csrf:
             return jsonify({'status':'fail','message':'Gagal dapat CSRF'}), 400
 
+        # Set cookie tambahan
         session.cookies.set('user_id', 'MzAwMDMwMQ%3D%3D')
         session.cookies.set('user_key', '8c96570b661c2e7ed3a4d46fbc432723')
 
         data = {
             'csrf_token': csrf,
-            'nomor_hp': '083879017166',
+            'nomor_hp': '083879017166',  # bisa diubah jika perlu
             'pembayaran': 'balance',
             'produk': produk,
             'operator': operator,
@@ -165,9 +210,10 @@ def cek_kuota():
             'json_format': '1'
         }
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': 'https://orderkuota.com/',
-            'X-Requested-With': 'XMLHttpRequest'
+            'X-Requested-With': 'XMLHttpRequest',
+            'Origin': 'https://orderkuota.com'
         }
         resp = session.post('https://orderkuota.com/cetak_voucher', data=data, headers=headers, timeout=60)
         try:
@@ -185,13 +231,14 @@ def cek_kuota():
         if not id_trx:
             return jsonify({'status':'fail','message':'ID transaksi tidak ditemukan'})
 
+        # Tunggu proses
         time.sleep(5)
         session.get(f'https://orderkuota.com/cek-status/trx/{id_trx}', headers=headers)
         time.sleep(7)
         det = session.get(f'https://orderkuota.com/akun/riwayat-transaksi/view/{id_trx}', headers=headers)
         html = det.text
 
-        # Cek kondisi error
+        # Cek berbagai kondisi error
         if re.search(r'(Anda telah mencapai batas maksimal|Nomor Tujuan Tidak Dapat di Proses)', html, re.I):
             return jsonify({'status':'fail','message':'⏳ Tunggu 3 jam untuk cek lagi'})
         if re.search(r'Nomor ini belum memiliki Paket', html, re.I):
