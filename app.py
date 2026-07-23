@@ -1,290 +1,216 @@
-import os
-import re
-import time
-import json
-import hashlib
-import requests
+import os, re, time, json, hashlib, requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-def clean_phone_number(number):
-    number = re.sub(r'[^0-9]', '', number)
-    if number.startswith('62'):
-        number = '0' + number[2:]
-    return number
+# ---------- FUNGSI PEMBERSIH NOMOR ----------
+def clean_phone_number(n):
+    n = re.sub(r'\D', '', n)
+    if n.startswith('62'):
+        n = '0' + n[2:]
+    return n
 
-def get_csrf_and_phpsessid():
-    session = requests.Session()
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36'
-    }
-    try:
-        resp = session.get('https://orderkuota.com/', headers=headers, timeout=30)
-        csrf_token = session.cookies.get('csrf_cookie', '')
-        phpsessid = session.cookies.get('PHPSESSID', '')
-        return session, csrf_token, phpsessid
-    except Exception as e:
-        print(f"[ERROR] Gagal ambil CSRF: {e}")
-        return None, '', ''
+# ---------- AMBIL CSRF & SESSION ----------
+def get_session_and_csrf():
+    s = requests.Session()
+    s.get('https://orderkuota.com/', headers={'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) Chrome/121'})
+    csrf = s.cookies.get('csrf_cookie', '')
+    return s, csrf
 
-def parse_packages(html_content):
+# ---------- PARSING PAKET (LENGKAP) ----------
+def parse_packages(html):
     # Hapus script & style
-    cleaned = re.sub(r'<(script|style)[^>]*?>.*?</\1>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<(script|style)[^>]*?>.*?</\1>', '', html, flags=re.DOTALL | re.IGNORECASE)
     cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
-    cleaned = re.sub(r'&[a-zA-Z]+;', lambda m: {'&nbsp;': ' '}.get(m.group(0), m.group(0)), cleaned)
-
-    # Ambil bagian setelah "SN/Ref"
+    cleaned = re.sub(r'&[a-zA-Z]+;', lambda m: {'&nbsp;':' '}.get(m.group(0), m.group(0)), cleaned)
+    
+    # Ambil setelah "SN/Ref"
     sn_match = re.search(r'SN/Ref\s*[:=]?\s*(.*?)(?=rusmanaid|Telp\.|Nominal|Harga|Tanggal|Print|Komplain|Testimonial|$)', cleaned, re.DOTALL | re.IGNORECASE)
-    if sn_match:
-        text = sn_match.group(1).strip()
-    else:
-        text = cleaned.strip()
-
+    text = sn_match.group(1).strip() if sn_match else cleaned.strip()
     text = re.sub(r'pesan\s*[:\=].*$', '', text, flags=re.IGNORECASE)
     text = re.sub(r'[\r\n\t]+', ' ', text)
-
-    packages_raw = text.split('|||')
-    if len(packages_raw) <= 1:
-        packages_raw = [text]
-
+    
+    raw = text.split('|||')
+    if len(raw) <= 1:
+        raw = [text]
+    
     packages = []
     seen = set()
-
-    for pkg in packages_raw:
+    for pkg in raw:
         pkg = pkg.strip(' -,;')
-        if not pkg:
+        if not pkg or re.search(r'Sisa Pulsa', pkg, re.I):
             continue
-        pkg_hash = hashlib.md5(pkg.encode()).hexdigest()
-        if pkg_hash in seen:
-            continue
-        seen.add(pkg_hash)
-
-        # Skip "Sisa Pulsa"
-        if re.search(r'Sisa Pulsa.*?Rp\s*[\d\.\,]+', pkg, re.IGNORECASE):
-            continue
-
-        # --- TELKOMSEL ---
-        if re.search(r'Masa Aktif Kartu|Info Paket Aktif', pkg, re.IGNORECASE):
-            expiry_match = re.search(r'Masa Aktif Kartu\s*:\s*([0-9\sA-Za-z]+)(?:\s*-)', pkg, re.IGNORECASE)
+        h = hashlib.md5(pkg.encode()).hexdigest()
+        if h in seen: continue
+        seen.add(h)
+        
+        # --- Telkomsel ---
+        if re.search(r'Masa Aktif Kartu|Info Paket Aktif', pkg, re.I):
+            expiry_match = re.search(r'Masa Aktif Kartu\s*:\s*([0-9\sA-Za-z]+)(?:\s*-)', pkg, re.I)
             expiry = expiry_match.group(1).strip() if expiry_match else '-'
-            reg_match = re.search(r'Status Registrasi\s*:\s*([a-zA-Z\s]+)(?:\s*-)', pkg, re.IGNORECASE)
+            reg_match = re.search(r'Status Registrasi\s*:\s*([a-zA-Z\s]+)(?:\s*-)', pkg, re.I)
             reg_status = reg_match.group(1).strip() if reg_match else ''
-
-            paket_section = re.split(r'Info Paket Aktif\s*:', pkg, flags=re.IGNORECASE)
+            
+            paket_section = re.split(r'Info Paket Aktif\s*:', pkg, flags=re.I)
             if len(paket_section) > 1:
-                paket_text = paket_section[1]
-                items = re.split(r'#\d+\s*-?\s*', paket_text)
+                items = re.split(r'#\d+\s*-?\s*', paket_section[1])
                 for item in items:
                     item = item.strip(' -.#')
-                    if not item:
-                        continue
-                    exp_match = re.search(r'aktif hingga\s*([^#\.]+)', item, re.IGNORECASE)
+                    if not item: continue
+                    exp_match = re.search(r'aktif hingga\s*([^#\.]+)', item, re.I)
                     exp = exp_match.group(1).strip() if exp_match else '-'
                     if exp_match:
-                        item = re.sub(r'aktif hingga\s*[^#\.]+', '', item, flags=re.IGNORECASE)
-                    quota_match = re.search(r'([\d\.]+\s*(?:GB|MB|KB|TB))\s*\/\s*([\d\.]+\s*(?:GB|MB|KB|TB))', item, re.IGNORECASE)
+                        item = re.sub(r'aktif hingga\s*[^#\.]+', '', item, flags=re.I)
+                    quota_match = re.search(r'([\d\.]+\s*(?:GB|MB|KB|TB))\s*\/\s*([\d\.]+\s*(?:GB|MB|KB|TB))', item, re.I)
+                    remaining = quota_match.group(0).strip() if quota_match else ''
                     if quota_match:
-                        remaining = quota_match.group(0).strip()
                         item = re.sub(r'[\d\.]+\s*(?:GB|MB|KB|TB)\s*\/\s*[\d\.]+\s*(?:GB|MB|KB|TB)', '', item)
-                    else:
-                        remaining = ''
-                    name = item.strip(' -/')
-                    if not name:
-                        name = 'Paket Internet'
-                    benefits = []
-                    if remaining:
-                        benefits.append({'name': 'Kuota Internet', 'remaining': remaining})
-                    packages.append({
-                        'name': name,
-                        'expiry': exp if exp != '-' else '',
-                        'benefits': benefits,
-                        'extra': {'registrasi': reg_status, 'masa_aktif_kartu': expiry}
-                    })
+                    name = item.strip(' -/') or 'Paket Internet'
+                    benefits = [{'name':'Kuota Internet','remaining':remaining}] if remaining else []
+                    packages.append({'name':name,'expiry':exp,'benefits':benefits,'extra':{'registrasi':reg_status,'masa_aktif_kartu':expiry}})
             continue
-
-        # --- INDOSAT / TRI ---
-        if re.search(r'Sisa Kuota\s*:', pkg, re.IGNORECASE):
-            parts = re.split(r'Sisa Kuota\s*:', pkg, flags=re.IGNORECASE)
-            left_part = parts[0].strip(' /,-')
-            right_part = parts[1].strip() if len(parts) > 1 else ''
-            expiry_match = re.search(r'\((.*?)\)', left_part)
-            expiry = expiry_match.group(1).strip() if expiry_match else '-'
-            name = re.sub(r'\(.*?\)', '', left_part).strip()
-            if not name:
-                name = 'Paket Data'
-            benefit_items = []
-            for b in right_part.split(','):
+        
+        # --- Indosat / Tri ---
+        if re.search(r'Sisa Kuota\s*:', pkg, re.I):
+            parts = re.split(r'Sisa Kuota\s*:', pkg, flags=re.I)
+            left = parts[0].strip(' /,-')
+            right = parts[1].strip() if len(parts)>1 else ''
+            exp_match = re.search(r'\((.*?)\)', left)
+            expiry = exp_match.group(1).strip() if exp_match else '-'
+            name = re.sub(r'\(.*?\)', '', left).strip() or 'Paket Data'
+            benefits = []
+            for b in right.split(','):
                 b = b.strip()
-                if not b:
-                    continue
-                m = re.match(r'^(.*?)\s*-\s*(.*?)\s*-\s*(?:Exp|Expired)\s*:(.*)$', b, re.IGNORECASE)
+                if not b: continue
+                m = re.match(r'^(.*?)\s*-\s*(.*?)\s*-\s*(?:Exp|Expired)\s*:(.*)$', b, re.I)
                 if m:
-                    benefit_items.append({
-                        'name': m.group(2).strip(),
-                        'remaining': m.group(1).strip(),
-                        'expiry': m.group(3).strip()
-                    })
+                    benefits.append({'name': m.group(2).strip(), 'remaining': m.group(1).strip(), 'expiry': m.group(3).strip()})
                 else:
-                    benefit_items.append({'name': b, 'remaining': ''})
-            packages.append({
-                'name': name,
-                'expiry': expiry,
-                'benefits': benefit_items
-            })
+                    benefits.append({'name': b, 'remaining': ''})
+            packages.append({'name':name,'expiry':expiry,'benefits':benefits})
             continue
-
-        # --- UMUM (XL, Axis, Smartfren) ---
-        general_match = re.match(r'^(.*?)(?:Expired|Exp\.|Exp|Berlaku s\/d)\s*[:\=]?\s*([\d\-\/[A-Za-z]+\s*[\d\:]*)(.*)$', pkg, re.IGNORECASE)
-        if general_match:
-            name = general_match.group(1).strip(' -.,')
-            expiry = general_match.group(2).strip()
-            benefit_str = general_match.group(3).strip(' -.,')
+        
+        # --- Umum (XL, Axis, Smartfren) ---
+        gmatch = re.match(r'^(.*?)(?:Expired|Exp\.|Exp|Berlaku s\/d)\s*[:\=]?\s*([\d\-\/[A-Za-z]+\s*[\d\:]*)(.*)$', pkg, re.I)
+        if gmatch:
+            name = gmatch.group(1).strip(' -.,')
+            expiry = gmatch.group(2).strip()
+            benefit_str = gmatch.group(3).strip(' -.,')
         else:
-            name = 'Paket Utama'
-            expiry = '-'
-            benefit_str = pkg
-
-        name = re.sub(r'^(?:Dukcapil\s*=\s*Registered|Registered)\s*[\/\-]?\s*', '', name, flags=re.IGNORECASE)
+            name, expiry, benefit_str = 'Paket Utama', '-', pkg
+        name = re.sub(r'^(?:Dukcapil\s*=\s*Registered|Registered)\s*[\/\-]?\s*', '', name, flags=re.I)
         name = re.sub(r'^\d+\.\s*', '', name)
-
-        benefit_items = []
-        parts_ben = re.split(r'(?=DATA\s)|,', benefit_str)
-        for b in parts_ben:
+        
+        benefits = []
+        for b in re.split(r'(?=DATA\s)|,', benefit_str):
             b = b.strip(' -,')
-            if not b:
-                continue
-            m = re.match(r'^(?:DATA\s+)?(.*?)\s+([\d\.]+\s*(?:GB|MB|KB|TB))$', b, re.IGNORECASE)
+            if not b: continue
+            m = re.match(r'^(?:DATA\s+)?(.*?)\s+([\d\.]+\s*(?:GB|MB|KB|TB))$', b, re.I)
             if m:
-                bname = m.group(1).strip()
-                if not bname:
-                    bname = 'Kuota Internet'
-                remaining = m.group(2).strip()
-                benefit_items.append({'name': bname, 'remaining': remaining})
+                bname = m.group(1).strip() or 'Kuota Internet'
+                benefits.append({'name': bname, 'remaining': m.group(2).strip()})
             else:
-                m2 = re.match(r'([\d\.]+\s*(?:Menit|SMS))\s+(.*)', b, re.IGNORECASE)
+                m2 = re.match(r'([\d\.]+\s*(?:Menit|SMS))\s+(.*)', b, re.I)
                 if m2:
-                    benefit_items.append({'name': m2.group(2).strip(), 'remaining': m2.group(1).strip()})
+                    benefits.append({'name': m2.group(2).strip(), 'remaining': m2.group(1).strip()})
                 else:
-                    b_clean = re.sub(r'DATA', '', b, flags=re.IGNORECASE).strip()
-                    if b_clean:
-                        odd_match = re.match(r'(.*?)\s+(\d+)\s+0$', b_clean)
-                        if odd_match:
-                            benefit_items.append({'name': odd_match.group(1).strip(), 'remaining': odd_match.group(2) + ' GB'})
+                    bclean = re.sub(r'DATA', '', b, flags=re.I).strip()
+                    if bclean:
+                        odd = re.match(r'(.*?)\s+(\d+)\s+0$', bclean)
+                        if odd:
+                            benefits.append({'name': odd.group(1).strip(), 'remaining': odd.group(2)+' GB'})
                         else:
-                            benefit_items.append({'name': b_clean, 'remaining': ''})
-
-        if not benefit_items and benefit_str:
-            benefit_items.append({'name': benefit_str, 'remaining': ''})
-
-        packages.append({
-            'name': name,
-            'expiry': expiry,
-            'benefits': benefit_items
-        })
-
+                            benefits.append({'name': bclean, 'remaining': ''})
+        if not benefits and benefit_str:
+            benefits.append({'name': benefit_str, 'remaining': ''})
+        packages.append({'name':name,'expiry':expiry,'benefits':benefits})
+    
     return packages
 
-
+# ---------- ROUTE HOME ----------
 @app.route('/')
 def home():
-    return "API Cek Kuota berjalan!"
+    return 'API Cek Kuota berjalan!'
 
-
+# ---------- ROUTE CEK KUOTA ----------
 @app.route('/cek_kuota', methods=['POST'])
 def cek_kuota():
     try:
-        nomor = request.form.get('no', '')
-        id_operator = request.form.get('id', '')
-        if not nomor or not id_operator:
-            return jsonify({'status': 'error', 'message': 'Parameter no dan id wajib diisi'}), 400
-
-        no = clean_phone_number(nomor)
-        parts = id_operator.split(',')
+        no_raw = request.form.get('no', '')
+        id_op = request.form.get('id', '')
+        if not no_raw or not id_op:
+            return jsonify({'status':'error','message':'Parameter no dan id wajib diisi'}), 400
+        
+        no = clean_phone_number(no_raw)
+        parts = id_op.split(',')
         if len(parts) < 3:
-            return jsonify({'status': 'error', 'message': 'Format id operator tidak valid'}), 400
-        voucher, produk, operator_id = parts[0], parts[1], parts[2]
+            return jsonify({'status':'error','message':'Format id tidak valid'}), 400
+        voucher, produk, operator = parts[0], parts[1], parts[2]
 
-        # Ambil CSRF
-        session, csrf_token, phpsessid = get_csrf_and_phpsessid()
-        if not session or not csrf_token or not phpsessid:
-            return jsonify({'status': 'fail', 'message': 'Gagal mendapatkan token CSRF'}), 400
+        session, csrf = get_session_and_csrf()
+        if not csrf:
+            return jsonify({'status':'fail','message':'Gagal dapat CSRF'}), 400
 
-        # Set cookie tambahan
         session.cookies.set('user_id', 'MzAwMDMwMQ%3D%3D')
         session.cookies.set('user_key', '8c96570b661c2e7ed3a4d46fbc432723')
 
-        headers_post = {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
-            'Referer': 'https://orderkuota.com/',
-            'Origin': 'https://orderkuota.com',
-            'X-Requested-With': 'XMLHttpRequest'
-        }
-
         data = {
-            'csrf_token': csrf_token,
+            'csrf_token': csrf,
             'nomor_hp': '083879017166',
             'pembayaran': 'balance',
             'produk': produk,
-            'operator': operator_id,
+            'operator': operator,
             'voucher': voucher,
             'id_plgn': no,
             'json_format': '1'
         }
-
-        resp_post = session.post('https://orderkuota.com/cetak_voucher', data=data, headers=headers_post, timeout=60)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
+            'Referer': 'https://orderkuota.com/',
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        resp = session.post('https://orderkuota.com/cetak_voucher', data=data, headers=headers, timeout=60)
         try:
-            result = resp_post.json()
+            res = resp.json()
         except:
-            return jsonify({'status': 'error', 'message': 'Respon tidak valid JSON'}), 500
+            return jsonify({'status':'fail','message':'Respon bukan JSON'}), 500
 
-        if 'errors' in result:
-            error_msg = result['errors'][0] if isinstance(result['errors'], list) else result['errors']
-            return jsonify({'status': 'fail', 'message': error_msg})
+        if 'errors' in res:
+            err = res['errors'][0] if isinstance(res['errors'], list) else res['errors']
+            return jsonify({'status':'fail','message':err})
+        if 'success' not in res:
+            return jsonify({'status':'fail','message':'Gagal memproses permintaan'})
 
-        if re.search(r'Sedang rekap dan pembukuan data harian pukul 23.40 - 00.10', resp_post.text, re.IGNORECASE):
-            return jsonify({'status': 'fail', 'message': '⏳ Layanan sedang rekap data (23.40–00.10), coba lagi nanti.'})
-
-        if 'success' not in result:
-            return jsonify({'status': 'fail', 'message': 'Gagal memproses permintaan'})
-
-        id_trx = result.get('id', '')
+        id_trx = res.get('id')
         if not id_trx:
-            return jsonify({'status': 'fail', 'message': 'ID transaksi tidak ditemukan'})
+            return jsonify({'status':'fail','message':'ID transaksi tidak ditemukan'})
 
         time.sleep(5)
-        session.get(f'https://orderkuota.com/cek-status/trx/{id_trx}', headers=headers_post, timeout=30)
+        session.get(f'https://orderkuota.com/cek-status/trx/{id_trx}', headers=headers)
         time.sleep(7)
+        det = session.get(f'https://orderkuota.com/akun/riwayat-transaksi/view/{id_trx}', headers=headers)
+        html = det.text
 
-        detail_resp = session.get(f'https://orderkuota.com/akun/riwayat-transaksi/view/{id_trx}', headers=headers_post, timeout=30)
-        detail_html = detail_resp.text
+        # Cek kondisi error
+        if re.search(r'(Anda telah mencapai batas maksimal|Nomor Tujuan Tidak Dapat di Proses)', html, re.I):
+            return jsonify({'status':'fail','message':'⏳ Tunggu 3 jam untuk cek lagi'})
+        if re.search(r'Nomor ini belum memiliki Paket', html, re.I):
+            return jsonify({'status':'fail','message':'❌ Nomor belum punya paket'})
+        if re.search(r'(Stts Beli\s*:\s*Gagal|Refund)', html, re.I):
+            return jsonify({'status':'fail','message':'❌ Gagal/Refund'})
+        if not re.search(r'SN/Ref', html, re.I):
+            return jsonify({'status':'fail','message':'❌ Gagal ambil data'})
 
-        if re.search(r'Anda telah mencapai batas maksimal pengecekan', detail_html, re.IGNORECASE):
-            return jsonify({'status': 'fail', 'message': '⏳ Silahkan tunggu 3 jam untuk cek kuota lagi dengan nomor yang sama.'})
-        if re.search(r'Nomor Tujuan Tidak Dapat di Proses', detail_html, re.IGNORECASE):
-            return jsonify({'status': 'fail', 'message': '⏳ Silahkan tunggu 3 jam untuk cek kuota lagi dengan nomor yang sama.'})
-        if re.search(r'Nomor ini belum memiliki Paket', detail_html, re.IGNORECASE):
-            return jsonify({'status': 'fail', 'message': '❌ Nomor ini belum memiliki paket kuota.'})
-        if re.search(r'(Stts Beli\s*:\s*Gagal|Status Pengisian\s*RF|Refund|Cek kembali nomor tujuan)', detail_html, re.IGNORECASE):
-            return jsonify({'status': 'fail', 'message': '❌ Pengecekan gagal: Nomor tidak valid atau sedang gangguan (Refund).'})
-        if not re.search(r'SN/Ref', detail_html, re.IGNORECASE):
-            return jsonify({'status': 'fail', 'message': '❌ Gagal mengambil data, coba lagi nanti.'})
-
-        packages = parse_packages(detail_html)
-
+        packages = parse_packages(html)
         return jsonify({
-            'status': 'success',
-            'message': '✅ Cek Kuota Berhasil!',
-            'data': {
-                'nomor': no,
-                'packages': packages
-            }
+            'status':'success',
+            'message':'✅ Cek Berhasil!',
+            'data': {'nomor': no, 'packages': packages}
         })
-
     except Exception as e:
-        print(f"[EXCEPTION] {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
+        return jsonify({'status':'error','message':str(e)}), 500
 
+# ---------- RUN ----------
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port)
